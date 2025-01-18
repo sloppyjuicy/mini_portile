@@ -13,7 +13,9 @@ class TestCook < TestCase
     create_tar(@tar_path, @assets_path, "test mini portile-1.0.0")
     start_webrick(File.dirname(@tar_path))
 
+    @logger = StringIO.new # IO to keep recipe logs in case we need to debug
     @recipe = MiniPortile.new("test mini portile", "1.0.0").tap do |recipe|
+      recipe.logger = @logger
       recipe.files << "http://localhost:#{HTTP_PORT}/#{ERB::Util.url_encode(File.basename(@tar_path))}"
       recipe.patch_files << File.join(@assets_path, "patch 1.diff")
       recipe.configure_options << "--option=\"path with 'space'\""
@@ -22,6 +24,9 @@ class TestCook < TestCase
         recipe.cook
       end
     end
+  rescue => e
+    puts @logger.string
+    raise e
   end
 
   def after_all
@@ -79,15 +84,35 @@ class TestCookConfiguration < TestCase
     end
   end
 
-  def test_gcc_command_configuration
+  def test_cc_command_configuration
     without_env("CC") do
       expected_compiler = RbConfig::CONFIG["CC"] || "gcc"
+      assert_equal(expected_compiler, MiniPortile.new("test", "1.0.0").cc_cmd)
       assert_equal(expected_compiler, MiniPortile.new("test", "1.0.0").gcc_cmd)
+      assert_equal("xyzzy", MiniPortile.new("test", "1.0.0", cc_command: "xyzzy").cc_cmd)
+      assert_equal("xyzzy", MiniPortile.new("test", "1.0.0", gcc_command: "xyzzy").cc_cmd)
+      assert_equal("xyzzy", MiniPortile.new("test", "1.0.0", cc_command: "xyzzy").gcc_cmd)
       assert_equal("xyzzy", MiniPortile.new("test", "1.0.0", gcc_command: "xyzzy").gcc_cmd)
     end
     with_env("CC"=>"asdf") do
+      assert_equal("asdf", MiniPortile.new("test", "1.0.0").cc_cmd)
       assert_equal("asdf", MiniPortile.new("test", "1.0.0").gcc_cmd)
+      assert_equal("asdf", MiniPortile.new("test", "1.0.0", cc_command: "xyzzy").cc_cmd)
+      assert_equal("asdf", MiniPortile.new("test", "1.0.0", gcc_command: "xyzzy").cc_cmd)
+      assert_equal("asdf", MiniPortile.new("test", "1.0.0", cc_command: "xyzzy").gcc_cmd)
       assert_equal("asdf", MiniPortile.new("test", "1.0.0", gcc_command: "xyzzy").gcc_cmd)
+    end
+  end
+
+  def test_cxx_command_configuration
+    without_env("CXX") do
+      expected_compiler = RbConfig::CONFIG["CXX"] || "g++"
+      assert_equal(expected_compiler, MiniPortile.new("test", "1.0.0").cxx_cmd)
+      assert_equal("xyzzy", MiniPortile.new("test", "1.0.0", cxx_command: "xyzzy").cxx_cmd)
+    end
+    with_env("CXX"=>"asdf") do
+      assert_equal("asdf", MiniPortile.new("test", "1.0.0").cxx_cmd)
+      assert_equal("asdf", MiniPortile.new("test", "1.0.0", cxx_command: "xyzzy").cxx_cmd)
     end
   end
 end
@@ -116,7 +141,9 @@ class TestCookWithBrokenGitDir < TestCase
 
     create_tar(@tar_path, @assets_path, "test mini portile-1.0.0")
 
+    @logger = StringIO.new # IO to keep recipe logs in case we need to debug
     @recipe = MiniPortile.new("test mini portile", "1.0.0").tap do |recipe|
+      recipe.logger = @logger
       recipe.files << "file://#{@tar_path}"
       recipe.patch_files << File.join(@assets_path, "patch 1.diff")
       recipe.configure_options << "--option=\"path with 'space'\""
@@ -146,7 +173,9 @@ class TestCookAgainstSourceDirectory < TestCase
   def setup
     super
 
+    @logger = StringIO.new # IO to keep recipe logs in case we need to debug
     @recipe ||= MiniPortile.new("test mini portile", "1.0.0").tap do |recipe|
+      recipe.logger = @logger
       recipe.source_directory = File.expand_path("../assets/test mini portile-1.0.0", __FILE__)
     end
   end

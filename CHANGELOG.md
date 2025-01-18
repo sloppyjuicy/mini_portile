@@ -1,5 +1,86 @@
 ## mini_portile changelog
 
+### 2.8.8 / 2024-11-14
+
+#### Improved
+
+- Raise an exception with a clear error message when `xzcat` is needed but is not installed. (#152) @flavorjones
+
+
+### 2.8.7 / 2024-05-31
+
+#### Added
+
+- When setting the C compiler through the `MiniPortile` constructor, the preferred keyword argument is now `:cc_command`. The original `:gcc_command` is still supported. (#144 by @flavorjones)
+- Add support for extracting xz-compressed tarballs on OpenBSD. (#141 by @postmodern)
+- Add OpenBSD support to the experimental method `MakeMakefile#mkmf_config`. (#141 by @flavorjones)
+
+
+#### Changed
+
+- `MiniPortileCMake` now detects the C and C++ compiler the same way `MiniPortile` does: by examining environment variables, then using kwargs, then looking in RbConfig (in that order). (#144 by @flavorjones)
+- GPG file verification error messages are captured in the raised exception. Previously these errors went to `stderr`. (#145 by @flavorjones)
+
+
+### 2.8.6 / 2024-04-14
+
+#### Added
+
+- When using CMake on FreeBSD, default to clang's "cc" and "c++" compilers. (#139 by @mudge)
+
+
+### 2.8.5 / 2023-10-22
+
+#### Added
+
+- New methods `#lib_path` and `#include_path` which point at the installed directories under `ports`. (by @flavorjones)
+- Add config param for CMAKE_BUILD_TYPE, which now defaults to `Release`. (#136 by @Watson1978)
+
+#### Experimental
+
+Introduce experimental support for `MiniPortile#mkmf_config` which sets up MakeMakefile variables to properly link against the recipe. This should make it easier for C extensions to package third-party libraries. (by @flavorjones)
+
+- With no arguments, will set up just `$INCFLAGS`, `$libs`, and `$LIBPATH`.
+- Optionally, if provided a pkg-config file, will use that config to more precisely set `$INCFLAGS`, `$libs`, `$LIBPATH`, and `$CFLAGS`/`$CXXFLAGS`.
+- Optionally, if provided the name of a static archive, will rewrite linker flags to ensure correct linkage.
+
+Note that the behavior may change slightly before official support is announced. Please comment on [#118](https://github.com/flavorjones/mini_portile/issues/118) if you have feedback.
+
+
+### 2.8.4 / 2023-07-18
+
+- cmake: set CMAKE compile flags to configure cross-compilation similarly to `autotools` `--host` flag: `SYSTEM_NAME`, `SYSTEM_PROCESSOR`, `C_COMPILER`, and `CXX_COMPILER`. [#130] (Thanks, @stanhu!)
+
+
+### 2.8.3 / 2023-07-18
+
+#### Fixed
+
+- cmake: only use MSYS/NMake generators when available. [#129] (Thanks, @stanhu!)
+
+
+### 2.8.2 / 2023-04-30
+
+#### Fixed
+
+- Ensure that the `source_directory` option will work when given a Windows path to an autoconf directory. [#126]
+
+
+### 2.8.1 / 2022-12-24
+
+#### Fixed
+
+- Support applying patches via `git apply` even when the working directory resembles a git directory. [#119] (Thanks, @h0tw1r3!)
+
+
+### 2.8.0 / 2022-02-20
+
+#### Added
+
+- Support xz-compressed archives (recognized by an `.xz` file extension).
+- When downloading a source archive, default open_timeout and read_timeout to 10 seconds, but allow configuration via open_timeout and read_timeout config parameters.
+
+
 ### 2.7.1 / 2021-10-20
 
 #### Packaging
@@ -9,7 +90,7 @@ A test artifact that has been included in the gem was being flagged by some user
 
 ### 2.7.0 / 2021-08-31
 
-### Added
+#### Added
 
 The commands used for "make", "compile", and "cmake" are configurable via keyword arguments. [#107] (Thanks, @cosmo0920!)
 

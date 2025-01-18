@@ -8,6 +8,7 @@ require 'open-uri'
 require 'cgi'
 require 'rbconfig'
 require 'shellwords'
+require 'open3'
 
 # Monkey patch for Net::HTTP by ruby open-uri fix:
 # https://github.com/ruby/ruby/commit/58835a9
@@ -27,23 +28,73 @@ class Net::HTTP
   end
 end
 
+$MINI_PORTILE_STATIC_LIBS = {}
+
 class MiniPortile
-  attr_reader :name, :version, :original_host
+  DEFAULT_TIMEOUT = 10
+
+  attr_reader :name, :version, :original_host, :source_directory
   attr_writer :configure_options
-  attr_accessor :host, :files, :patch_files, :target, :logger, :source_directory
+  attr_accessor :host, :files, :patch_files, :target, :logger
 
   def self.windows?
-    RbConfig::CONFIG['target_os'] =~ /mswin|mingw/
+    target_os =~ /mswin|mingw/
   end
 
   # GNU MinGW compiled Ruby?
   def self.mingw?
-    RbConfig::CONFIG['target_os'] =~ /mingw/
+    target_os =~ /mingw/
   end
 
   # MS Visual-C compiled Ruby?
   def self.mswin?
-    RbConfig::CONFIG['target_os'] =~ /mswin/
+    target_os =~ /mswin/
+  end
+
+  def self.darwin?
+    target_os =~ /darwin/
+  end
+
+  def self.freebsd?
+    target_os =~ /freebsd/
+  end
+
+  def self.openbsd?
+    target_os =~ /openbsd/
+  end
+
+  def self.linux?
+    target_os =~ /linux/
+  end
+
+  def self.solaris?
+    target_os =~ /solaris/
+  end
+
+  def self.target_os
+    RbConfig::CONFIG['target_os']
+  end
+
+  def self.target_cpu
+    RbConfig::CONFIG['target_cpu']
+  end
+
+  def self.native_path(path)
+    path = File.expand_path(path)
+    if File::ALT_SEPARATOR
+      path.tr(File::SEPARATOR, File::ALT_SEPARATOR)
+    else
+      path
+    end
+  end
+
+  def self.posix_path(path)
+    path = File.expand_path(path)
+    if File::ALT_SEPARATOR
+      "/" + path.tr(File::ALT_SEPARATOR, File::SEPARATOR).tr(":", File::SEPARATOR)
+    else
+      path
+    end
   end
 
   def initialize(name, version, **kwargs)
@@ -53,22 +104,25 @@ class MiniPortile
     @files = []
     @patch_files = []
     @log_files = {}
-    @logger = STDOUT
+    @logger = kwargs[:logger] || STDOUT
     @source_directory = nil
 
-    @original_host = @host = detect_host
-
-    @gcc_command = kwargs[:gcc_command]
+    @cc_command = kwargs[:cc_command] || kwargs[:gcc_command]
+    @cxx_command = kwargs[:cxx_command]
     @make_command = kwargs[:make_command]
+    @open_timeout = kwargs[:open_timeout] || DEFAULT_TIMEOUT
+    @read_timeout = kwargs[:read_timeout] || DEFAULT_TIMEOUT
+
+    @original_host = @host = detect_host
   end
 
   def source_directory=(path)
-    @source_directory = File.expand_path(path)
+    @source_directory = posix_path(path)
   end
 
   def prepare_build_directory
     raise "source_directory is not set" if source_directory.nil?
-    output "Building #{@name} #{@version} from source at '#{source_directory}'"
+    output "Building #{@name} from source at '#{source_directory}'"
     FileUtils.mkdir_p(File.join(tmp_path, [name, version].join("-")))
     FileUtils.rm_rf(port_path) # make sure we always re-install
   end
@@ -95,9 +149,9 @@ class MiniPortile
       when which('git')
         lambda { |file|
           message "Running git apply with #{file}... "
-          # By --work-tree=. git-apply uses the current directory as
-          # the project root and will not search upwards for .git.
-          execute('patch', ["git", "--git-dir=.", "--work-tree=.", "apply", "--whitespace=warn", file], :initial_message => false)
+          Dir.mktmpdir do |tmp_git_dir|
+            execute('patch', ["git", "--git-dir=#{tmp_git_dir}", "--work-tree=.", "apply", "--whitespace=warn", file], :initial_message => false)
+          end
         }
       when which('patch')
         lambda { |file|
@@ -133,7 +187,7 @@ class MiniPortile
       # Windows doesn't recognize the shebang.
       command.unshift("sh")
     end
-    execute('configure', command + computed_options)
+    execute('configure', command + computed_options, altlog: "config.log")
   end
 
   def compile
@@ -187,19 +241,15 @@ class MiniPortile
   end
 
   def activate
-    lib_path = File.join(port_path, "lib")
     vars = {
       'PATH'          => File.join(port_path, 'bin'),
-      'CPATH'         => File.join(port_path, 'include'),
-      'LIBRARY_PATH'  => lib_path
+      'CPATH'         => include_path,
+      'LIBRARY_PATH'  => lib_path,
     }.reject { |env, path| !File.directory?(path) }
 
     output "Activating #{@name} #{@version} (from #{port_path})..."
     vars.each do |var, path|
-      full_path = File.expand_path(path)
-
-      # turn into a valid Windows path (if required)
-      full_path.gsub!(File::SEPARATOR, File::ALT_SEPARATOR) if File::ALT_SEPARATOR
+      full_path = native_path(path)
 
       # save current variable value
       old_value = ENV[var] || ''
@@ -211,7 +261,7 @@ class MiniPortile
 
     # rely on LDFLAGS when cross-compiling
     if File.exist?(lib_path) && (@host != @original_host)
-      full_path = File.expand_path(lib_path)
+      full_path = native_path(lib_path)
 
       old_value = ENV.fetch("LDFLAGS", "")
 
@@ -221,19 +271,129 @@ class MiniPortile
     end
   end
 
+  # pkg: the pkg-config file name (without the .pc extension)
+  # dir: inject the directory path for the pkg-config file (probably only useful for tests)
+  # static: the name of the static library archive (without the "lib" prefix or the file extension), or nil for dynamic linking
+  #
+  # we might be able to be terribly clever and infer the name of the static archive file, but
+  # unfortunately projects have so much freedom in what they can report (for name, for libs, etc.)
+  # that it feels unreliable to try to do so, so I'm preferring to just have the developer make it
+  # explicit.
+  def mkmf_config(pkg: nil, dir: nil, static: nil)
+    require "mkmf"
+
+    if pkg
+      dir ||= File.join(lib_path, "pkgconfig")
+      pcfile = File.join(dir, "#{pkg}.pc")
+      unless File.exist?(pcfile)
+        raise ArgumentError, "pkg-config file '#{pcfile}' does not exist"
+      end
+
+      output "Configuring MakeMakefile for #{File.basename(pcfile)} (in #{File.dirname(pcfile)})\n"
+
+      # on macos, pkg-config will not return --cflags without this
+      ENV["PKG_CONFIG_ALLOW_SYSTEM_CFLAGS"] = "t"
+
+      # append to PKG_CONFIG_PATH as we go, so later pkg-config files can depend on earlier ones
+      ENV["PKG_CONFIG_PATH"] = [ENV["PKG_CONFIG_PATH"], dir].compact.join(File::PATH_SEPARATOR)
+
+      incflags = minimal_pkg_config(pcfile, "cflags-only-I")
+      cflags = minimal_pkg_config(pcfile, "cflags-only-other")
+      if static
+        ldflags = minimal_pkg_config(pcfile, "libs-only-L", "static")
+        libflags = minimal_pkg_config(pcfile, "libs-only-l", "static")
+      else
+        ldflags = minimal_pkg_config(pcfile, "libs-only-L")
+        libflags = minimal_pkg_config(pcfile, "libs-only-l")
+      end
+    else
+      output "Configuring MakeMakefile for #{@name} #{@version} (from #{path})\n"
+
+      lib_name = name.sub(/\Alib/, "") # TODO: use delete_prefix when we no longer support ruby 2.4
+
+      incflags = Dir.exist?(include_path) ? "-I#{include_path}" : ""
+      cflags = ""
+      ldflags = Dir.exist?(lib_path) ? "-L#{lib_path}" : ""
+      libflags = Dir.exist?(lib_path) ? "-l#{lib_name}" : ""
+    end
+
+    if static
+      libdir = lib_path
+      if pcfile
+        pcfile_libdir = minimal_pkg_config(pcfile, "variable=libdir").strip
+        libdir = pcfile_libdir unless pcfile_libdir.empty?
+      end
+
+      #
+      # keep track of the libraries we're statically linking against, and fix up ldflags and
+      # libflags to make sure we link statically against the recipe's libaries.
+      #
+      # this avoids the unintentionally dynamically linking against system libraries, and makes sure
+      # that if multiple pkg-config files reference each other that we are able to intercept flags
+      # from dependent packages that reference the static archive.
+      #
+      $MINI_PORTILE_STATIC_LIBS[static] = libdir
+      static_ldflags = $MINI_PORTILE_STATIC_LIBS.values.map { |v| "-L#{v}" }
+      static_libflags = $MINI_PORTILE_STATIC_LIBS.keys.map { |v| "-l#{v}" }
+
+      # remove `-L#{libdir}` and `-lfoo`. we don't need them since we link against the static
+      # archive using the full path.
+      ldflags = ldflags.shellsplit.reject { |f| static_ldflags.include?(f) }.shelljoin
+      libflags = libflags.shellsplit.reject { |f| static_libflags.include?(f) }.shelljoin
+
+      # prepend the full path to the static archive to the linker flags
+      static_archive = File.join(libdir, "lib#{static}.#{$LIBEXT}")
+      libflags = [static_archive, libflags].join(" ").strip
+    end
+
+    # prefer this package by prepending to search paths and library flags
+    #
+    # convert the ldflags into a list of directories and append to $LIBPATH (instead of just using
+    # $LDFLAGS) to ensure we get the `-Wl,-rpath` linker flag for re-finding shared libraries.
+    $INCFLAGS = [incflags, $INCFLAGS].join(" ").strip
+    libpaths = ldflags.shellsplit.map { |f| f.sub(/\A-L/, "") }
+    $LIBPATH = libpaths | $LIBPATH
+    $libs = [libflags, $libs].join(" ").strip
+
+    # prefer this package's compiler flags by appending them to the command line
+    $CFLAGS = [$CFLAGS, cflags].join(" ").strip
+    $CXXFLAGS = [$CXXFLAGS, cflags].join(" ").strip
+  end
+
   def path
     File.expand_path(port_path)
   end
 
-  def gcc_cmd
-    (ENV["CC"] || @gcc_command || RbConfig::CONFIG["CC"] || "gcc").dup
+  def include_path
+    File.join(path, "include")
+  end
+
+  def lib_path
+    File.join(path, "lib")
+  end
+
+  def cc_cmd
+    (ENV["CC"] || @cc_command || RbConfig::CONFIG["CC"] || "gcc").dup
+  end
+  alias :gcc_cmd :cc_cmd
+
+  def cxx_cmd
+    (ENV["CXX"] || @cxx_command || RbConfig::CONFIG["CXX"] || "g++").dup
   end
 
   def make_cmd
     (ENV["MAKE"] || @make_command || ENV["make"] || "make").dup
   end
 
-private
+  private
+
+  def native_path(path)
+    MiniPortile.native_path(path)
+  end
+
+  def posix_path(path)
+    MiniPortile.posix_path(path)
+  end
 
   def tmp_path
     "tmp/#{@host}/ports/#{@name}/#{@version}"
@@ -302,24 +462,29 @@ private
       gpg_exe = which('gpg2') || which('gpg') || raise("Neither GPG nor GPG2 is installed")
 
       # import the key into our own keyring
-      gpg_status = IO.popen([gpg_exe, "--status-fd", "1", "--no-default-keyring", "--keyring", KEYRING_NAME, "--import"], "w+") do |io|
-        io.write gpg[:key]
-        io.close_write
-        io.read
+      gpg_error = nil
+      gpg_status = Open3.popen3(gpg_exe, "--status-fd", "1", "--no-default-keyring", "--keyring", KEYRING_NAME, "--import") do |gpg_in, gpg_out, gpg_err, _thread|
+        gpg_in.write gpg[:key]
+        gpg_in.close
+        gpg_error = gpg_err.read
+        gpg_out.read
       end
       key_ids = gpg_status.scan(/\[GNUPG:\] IMPORT_OK \d+ (?<key_id>[0-9a-f]+)/i).map(&:first)
-      raise "invalid gpg key provided" if key_ids.empty?
+      raise "invalid gpg key provided:\n#{gpg_error}" if key_ids.empty?
 
-      # verify the signature against our keyring
-      gpg_status = IO.popen([gpg_exe, "--status-fd", "1", "--no-default-keyring", "--keyring", KEYRING_NAME, "--verify", signature_file, file[:local_path]], &:read)
+      begin
+        # verify the signature against our keyring
+        gpg_status, gpg_error, _status = Open3.capture3(gpg_exe, "--status-fd", "1", "--no-default-keyring", "--keyring", KEYRING_NAME, "--verify", signature_file, file[:local_path])
 
-      # remove the key from our keyring
-      key_ids.each do |key_id|
-        IO.popen([gpg_exe, "--batch", "--yes", "--no-default-keyring", "--keyring", KEYRING_NAME, "--delete-keys", key_id], &:read)
-        raise "unable to delete the imported key" unless $?.exitstatus==0
+        raise "signature mismatch:\n#{gpg_error}" unless gpg_status.match(/^\[GNUPG:\] VALIDSIG/)
+      ensure
+        # remove the key from our keyring
+        key_ids.each do |key_id|
+          IO.popen([gpg_exe, "--batch", "--yes", "--no-default-keyring", "--keyring", KEYRING_NAME, "--delete-keys", key_id], &:read)
+          raise "unable to delete the imported key" unless $?.exitstatus==0
+        end
       end
 
-      raise "signature mismatch" unless gpg_status.match(/^\[GNUPG:\] VALIDSIG/)
 
     else
       digest = case
@@ -341,28 +506,6 @@ private
       File.expand_path("#{action}.log", tmp_path).tap { |file|
         File.unlink(file) if File.exist?(file)
       }
-  end
-
-  TAR_EXECUTABLES = %w[gtar bsdtar tar basic-bsdtar]
-  def tar_exe
-    @@tar_exe ||= begin
-      TAR_EXECUTABLES.find { |c|
-        which(c)
-      } or raise("tar not found - please make sure that one of the following commands is in the PATH: #{TAR_EXECUTABLES.join(", ")}")
-    end
-  end
-
-  def tar_compression_switch(filename)
-    case File.extname(filename)
-      when '.gz', '.tgz'
-        'z'
-      when '.bz2', '.tbz2'
-        'j'
-      when '.Z'
-        'Z'
-      else
-        ''
-    end
   end
 
   # From: http://stackoverflow.com/a/5471032/7672
@@ -391,6 +534,8 @@ private
       output = `#{gcc_cmd} -v 2>&1`
       if m = output.match(/^Target\: (.*)$/)
         @detect_host = m[1]
+      else
+        @detect_host = nil
       end
 
       @detect_host
@@ -399,12 +544,39 @@ private
     end
   end
 
+  TAR_EXECUTABLES = %w[gtar bsdtar tar basic-bsdtar]
+  def tar_exe
+    @@tar_exe ||= begin
+      TAR_EXECUTABLES.find { |c|
+        which(c)
+      } or raise("tar not found - please make sure that one of the following commands is in the PATH: #{TAR_EXECUTABLES.join(", ")}")
+    end
+  end
+
+  def xzcat_exe
+    @@xzcat_exe ||= which("xzcat") ? "xzcat" : raise("xzcat not found")
+  end
+
+  def tar_command(file, target)
+    case File.extname(file)
+      when '.gz', '.tgz'
+        [tar_exe, 'xzf', file, '-C', target]
+      when '.bz2', '.tbz2'
+        [tar_exe, 'xjf', file, '-C', target]
+      when '.xz'
+        # NOTE: OpenBSD's tar command does not support the -J option
+        "#{xzcat_exe.shellescape} #{file.shellescape} | #{tar_exe.shellescape} xf - -C #{target.shellescape}"
+      else
+        [tar_exe, 'xf', file, '-C', target]
+    end
+  end
+
   def extract_file(file, target)
     filename = File.basename(file)
     FileUtils.mkdir_p target
 
     message "Extracting #{filename} into #{target}... "
-    execute('extract', [tar_exe, "#{tar_compression_switch(filename)}xf", file, "-C", target], {:cd => Dir.pwd, :initial_message => false})
+    execute('extract', tar_command(file, target) , {:cd => Dir.pwd, :initial_message => false})
   end
 
   # command could be an array of args, or one string containing a command passed to the shell. See
@@ -414,6 +586,7 @@ private
     opt_debug =   command_opts.fetch(:debug, false)
     opt_cd =      command_opts.fetch(:cd) { work_path }
     opt_env =     command_opts.fetch(:env) { Hash.new }
+    opt_altlog =  command_opts.fetch(:altlog, nil)
 
     log_out = log_file(action)
 
@@ -444,12 +617,12 @@ private
         output "OK"
         return true
       else
-        if File.exist? log_out
-          output "ERROR, review '#{log_out}' to see what happened. Last lines are:"
-          output("=" * 72)
-          log_lines = File.readlines(log_out)
-          output(log_lines[-[log_lines.length, 20].min .. -1])
-          output("=" * 72)
+        output "ERROR. Please review logs to see what happened:\n"
+        [log_out, opt_altlog].compact.each do |log|
+          next unless File.exist?(log)
+          output("----- contents of '#{log}' -----")
+          output(File.read(log))
+          output("----- end of file -----")
         end
         raise "Failed to complete #{action} task"
       end
@@ -512,7 +685,9 @@ private
             # Content-Length is unavailable because Transfer-Encoding is chunked
             message "\rDownloading %s " % [filename]
           end
-        }
+        },
+        :open_timeout => @open_timeout,
+        :read_timeout => @read_timeout,
       }
       proxy_uri = URI.parse(url).scheme.downcase == 'https' ?
                   ENV["https_proxy"] :
@@ -537,7 +712,7 @@ private
         return download_file(redirect.url, full_path, count-1)
       rescue => e
         count = count - 1
-        puts "#{count} retrie(s) left for #{filename}"
+        @logger.puts "#{count} retrie(s) left for #{filename} (#{e.message})"
         if count > 0
           sleep 1
           return download_file_http(url, full_path, count)
@@ -564,7 +739,9 @@ private
         :progress_proc => lambda{|bytes|
           new_progress = (bytes * 100) / total
           message "\rDownloading %s (%3d%%) " % [filename, new_progress]
-        }
+        },
+        :open_timeout => @open_timeout,
+        :read_timeout => @read_timeout,
       }
       if ENV["ftp_proxy"]
         _, userinfo, _p_host, _p_port = URI.split(ENV['ftp_proxy'])
@@ -593,5 +770,30 @@ private
     File.unlink full_path if File.exist?(full_path)
     FileUtils.mkdir_p File.dirname(full_path)
     FileUtils.mv temp_file.path, full_path, :force => true
+  end
+
+  #
+  #  this minimal version of pkg_config is based on ruby 29dc9378 (2023-01-09)
+  #
+  #  specifically with the fix from b90e56e6 to support multiple pkg-config options, and removing
+  #  code paths that aren't helpful for mini-portile's use case of parsing pc files.
+  #
+  def minimal_pkg_config(pkg, *pcoptions)
+    if pcoptions.empty?
+      raise ArgumentError, "no pkg-config options are given"
+    end
+
+    if ($PKGCONFIG ||=
+        (pkgconfig = MakeMakefile.with_config("pkg-config") {MakeMakefile.config_string("PKG_CONFIG") || "pkg-config"}) &&
+        MakeMakefile.find_executable0(pkgconfig) && pkgconfig)
+      pkgconfig = $PKGCONFIG
+    else
+      raise RuntimeError, "pkg-config is not found"
+    end
+
+    pcoptions = Array(pcoptions).map { |o| "--#{o}" }
+    response = IO.popen([pkgconfig, *pcoptions, pkg], err:[:child, :out], &:read)
+    raise RuntimeError, response unless $?.success?
+    response.strip
   end
 end

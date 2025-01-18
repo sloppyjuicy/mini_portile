@@ -85,20 +85,29 @@ system-wide installation.
 
 Some keyword arguments can be passed to the constructor to configure the commands used:
 
-#### `gcc_command`
+#### `cc_command` and `cxx_command`
 
-The compiler command that is used is configurable, and in order of preference will use:
+The C compiler command that is used is configurable, and in order of preference will use:
 
 - the `CC` environment variable (if present)
-- the `gcc_command` value passed in to the constructor
+- the `:cc_command` keyword argument passed in to the constructor
 - `RbConfig::CONFIG["CC"]`
 - `"gcc"`
 
-You can pass it in like so:
+The C++ compiler is similarly configuratble, and in order of preference will use:
+
+- the `CXX` environment variable (if present)
+- the `:cxx_command` keyword argument passed in to the constructor
+- `RbConfig::CONFIG["CXX"]`
+- `"g++"`
+
+You can pass your compiler commands to the MiniPortile constructor:
 
 ``` ruby
-MiniPortile.new("libiconv", "1.13.1", gcc_command: "cc")
+MiniPortile.new("libiconv", "1.13.1", cc_command: "clang", cxx_command: "clang++")
 ```
+
+(For backwards compatibility, the constructor also supports a keyword argument `:gcc_command` for the C compiler.)
 
 #### `make_command`
 
@@ -115,6 +124,15 @@ You can pass it in like so:
 MiniPortile.new("libiconv", "1.13.1", make_command: "nmake")
 ```
 
+#### `open_timeout`, `read_timeout`
+
+By default, when downloading source archives, MiniPortile will use a timeout value of 10
+seconds. This can be overridden by passing a different value (in seconds):
+
+``` ruby
+MiniPortile.new("libiconv", "1.13.1", open_timeout: 99, read_timeout: 2)
+```
+
 
 ### How to use (for cmake projects)
 
@@ -129,13 +147,27 @@ This is configurable as above, except for Windows systems where it's hardcoded t
 The cmake command used is configurable, and in order of preference will use:
 
 - the `CMAKE` environment variable (if present)
-- the `cmake_command` value passed in to the constructor
-- `"cmake"`
+- the `:cmake_command` keyword argument passed into the constructor
+- `"cmake"` (the default)
 
 You can pass it in like so:
 
 ``` ruby
 MiniPortileCMake.new("libfoobar", "1.3.5", cmake_command: "cmake3")
+```
+
+#### `cmake_build_type`
+
+The cmake build type is configurable as of v2.8.5, and in order of preference will use:
+
+- the `CMAKE_BUILD_TYPE` environment variable (if present)
+- the `:cmake_build_type` keyword argument passed into the constructor
+- `"Release"` (the default)
+
+You can pass it in like so:
+
+``` ruby
+MiniPortileCMake.new("libfoobar", "1.3.5", cmake_build_type: "Debug")
 ```
 
 ### Local source directories
